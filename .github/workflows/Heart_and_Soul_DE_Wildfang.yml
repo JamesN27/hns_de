@@ -1,0 +1,131 @@
+name: Heart and Soul DE - Wilde Wunschbegegnung
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-wild-catch:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out German Heart and Soul source
+        uses: actions/checkout@v4
+
+      - name: Install GBA toolchain and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils-arm-none-eabi gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libpng-dev python3 make gcc g++
+
+      - name: Enable Debug menu and add one-use wild encounter picker
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          
+          
+          def replace_once(path, old, new):
+              p=Path(path)
+              s=p.read_text(encoding='utf-8')
+              count=s.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{p}: expected exactly 1 match, got {count} for {old[:55]!r}')
+              p.write_text(s.replace(old,new,1),encoding='utf-8')
+          
+          p='include/config/debug.h'
+          replace_once(p, '#define DEBUG_OVERWORLD_MENU            DISABLED_ON_RELEASE', '#define DEBUG_OVERWORLD_MENU            TRUE')
+          replace_once(p, '#define DEBUG_OVERWORLD_IN_MENU         FALSE', '#define DEBUG_OVERWORLD_IN_MENU         TRUE')
+          
+          p='include/wild_encounter.h'
+          replace_once(p,'void CreateWildMon(u16 species, u8 level);', 'void CreateWildMon(u16 species, u8 level);\nvoid DebugSetNextWildEncounterSpecies(u16 species);')
+          
+          p='src/wild_encounter.c'
+          replace_once(p, 'void DisableWildEncounters(bool8 disabled)\n{', '''// One-use override for a naturally triggered wild encounter. No change to the randomizer seed.
+          EWRAM_DATA static u16 sDebugNextWildSpecies = SPECIES_NONE;
+          
+          void DebugSetNextWildEncounterSpecies(u16 species)
+          {
+              sDebugNextWildSpecies = species;
+          }
+          
+          void DisableWildEncounters(bool8 disabled)
+          {''')
+          replace_once(p, '''        species = RandomizeWildEncounter(species, gSaveBlock1Ptr->location.mapNum, gSaveBlock1Ptr->location.mapGroup, area, wildMonIndex);
+                  #endif
+                  CreateWildMon(species, level);''', '''        species = RandomizeWildEncounter(species, gSaveBlock1Ptr->location.mapNum, gSaveBlock1Ptr->location.mapGroup, area, wildMonIndex);
+                  #endif
+                  // Override only after Similar Strength / map-seeded randomization has run.
+                  if (sDebugNextWildSpecies != SPECIES_NONE)
+                  {
+                      species = sDebugNextWildSpecies;
+                      sDebugNextWildSpecies = SPECIES_NONE;
+                  }
+                  CreateWildMon(species, level);''')
+          replace_once(p, '''    UpdateChainFishingStreak();
+              CreateWildMon(wildMonSpecies, level);''', '''    if (sDebugNextWildSpecies != SPECIES_NONE)
+              {
+                  wildMonSpecies = sDebugNextWildSpecies;
+                  sDebugNextWildSpecies = SPECIES_NONE;
+              }
+              UpdateChainFishingStreak();
+              CreateWildMon(wildMonSpecies, level);''')
+          
+          p='src/debug.c'
+          replace_once(p,'static void DebugAction_Give_PokemonSimple(u8 taskId);', 'static void DebugAction_Give_PokemonSimple(u8 taskId);\nstatic void DebugAction_Give_PokemonWild(u8 taskId);')
+          replace_once(p,'    { COMPOUND_STRING("Pokémon (Complex)"), DebugAction_Give_PokemonComplex },', '    { COMPOUND_STRING("Pokémon (Complex)"), DebugAction_Give_PokemonComplex },\n    { COMPOUND_STRING("Pokémon (Wild)"),    DebugAction_Give_PokemonWild },')
+          replace_once(p,'#define tIsEgg      data[8]', '#define tIsEgg      data[8]\n#define tIsWild     data[9]')
+          replace_once(p, '''    gTasks[taskId].tIsComplex = FALSE;
+              gTasks[taskId].tIsEgg = FALSE;
+          
+              FreeMonIconPalettes();''', '''    gTasks[taskId].tIsComplex = FALSE;
+              gTasks[taskId].tIsEgg = FALSE;
+              gTasks[taskId].tIsWild = FALSE;
+          
+              FreeMonIconPalettes();''')
+          replace_once(p, '''static void DebugAction_Give_PokemonComplex(u8 taskId)
+          {''', '''// Select a Pokémon for the NEXT regular wild encounter instead of adding it to the team.
+          // It will use the normal encounter level, battle animation and capture mechanics.
+          static void DebugAction_Give_PokemonWild(u8 taskId)
+          {
+              DebugAction_Give_PokemonSimple(taskId);
+              gTasks[taskId].tIsWild = TRUE;
+          }
+          
+          static void DebugAction_Give_PokemonComplex(u8 taskId)
+          {''')
+          replace_once(p, '''        sDebugMonData->species = gTasks[taskId].tInput;
+                  gTasks[taskId].tInput = 1;
+                  gTasks[taskId].tDigit = 0;''', '''        sDebugMonData->species = gTasks[taskId].tInput;
+          
+                  if (gTasks[taskId].tIsWild)
+                  {
+                      DebugSetNextWildEncounterSpecies(sDebugMonData->species);
+                      PlaySE(SE_SELECT);
+                      Free(sDebugMonData);
+                      FreeMonIconPalettes();
+                      FreeAndDestroyMonIconSprite(&gSprites[gTasks[taskId].tSpriteId]);
+                      DebugAction_DestroyExtraWindow(taskId);
+                      return;
+                  }
+          
+                  gTasks[taskId].tInput = 1;
+                  gTasks[taskId].tDigit = 0;''')
+          replace_once(p,'#undef tIsEgg\n', '#undef tIsEgg\n#undef tIsWild\n')
+          print('Patch applied successfully: Debug -> Give X -> Pokémon (Wild).')
+          PYCODE
+
+      - name: Build German Heart and Soul ROM
+        run: make -j2 hns
+
+      - name: Verify output
+        run: |
+          test -s pokehns.gba
+          ls -lh pokehns.gba
+
+      - name: Downloadable ROM
+        uses: actions/upload-artifact@v4
+        with:
+          name: Heart-and-Soul-DE-Wildfang-ROM
+          path: pokehns.gba
+          if-no-files-found: error
+          retention-days: 7
