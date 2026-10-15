@@ -1,0 +1,57 @@
+name: Heart and Soul Deutsch - Debug ROM
+
+on:
+  push:
+    paths:
+      - '.github/workflows/Heart_and_Soul_DE_Debug_Build.yml'
+  workflow_dispatch:
+
+jobs:
+  build-debug-rom:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out German Heart and Soul source
+        uses: actions/checkout@v4
+
+      - name: Install GBA toolchain and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils-arm-none-eabi gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libpng-dev python3 make gcc g++
+
+      - name: Enable in-game Debug start menu
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('include/config/debug.h')
+          s = p.read_text(encoding='utf-8')
+          before = '#define DEBUG_OVERWORLD_MENU            DISABLED_ON_RELEASE'
+          after = '#define DEBUG_OVERWORLD_MENU            TRUE'
+          before_in_menu = '#define DEBUG_OVERWORLD_IN_MENU         FALSE'
+          after_in_menu = '#define DEBUG_OVERWORLD_IN_MENU         TRUE'
+          if before not in s and after not in s:
+              raise SystemExit('DEBUG_OVERWORLD_MENU not found - source changed')
+          if before_in_menu not in s and after_in_menu not in s:
+              raise SystemExit('DEBUG_OVERWORLD_IN_MENU not found - source changed')
+          s = s.replace(before, after, 1).replace(before_in_menu, after_in_menu, 1)
+          p.write_text(s, encoding='utf-8')
+          print('DEBUG menu enabled in German source')
+          PY
+
+      - name: Build Heart and Soul German ROM
+        run: make -j2 hns
+
+      - name: Verify build output
+        run: |
+          test -s pokehns.gba
+          ls -lh pokehns.gba
+
+      - name: Upload finished ROM
+        uses: actions/upload-artifact@v4
+        with:
+          name: Heart-and-Soul-DE-Debug-ROM
+          path: pokehns.gba
+          if-no-files-found: error
+          retention-days: 7
