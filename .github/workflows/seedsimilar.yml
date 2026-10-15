@@ -1,0 +1,478 @@
+name: Heart & Soul - Similar Strength Wunschteam-Seed
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hns_team_seed_similar.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  team-seed:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: Deutsches Heart and Soul Projekt laden
+        uses: actions/checkout@v4
+
+      - name: Seed-Finder erstellen
+        shell: bash
+        run: |
+          cat > hns_seed_finder.py <<'PYCODE'
+          #!/usr/bin/env python3
+          """Heart & Soul (German fork): reproducible seed explorer.
+          Run from repository root. Reads game source, builds a native search program,
+          produces CSV reports. This is an independent *candidate* calculator: validate
+          its predictions in-game before relying on them for a long playthrough.
+          """
+          from __future__ import annotations
+          import json, re, subprocess, tempfile, csv, collections, pathlib
+          P = pathlib.Path('.')
+          OUT = pathlib.Path('seed_finder_output'); OUT.mkdir(exist_ok=True)
+          TARGETS = [
+              ('Mähikel', 'SKIDDO'), ('Seeper', 'HORSEA'), ('Voltrel', 'WATTREL'),
+              ('Wolly', 'WOOLOO'), ('Urgl', 'CRAMORANT'), ('Lithomith', 'DWEBBLE')]
+          # The map order is by story access, not necessarily by map ID or level.
+          EARLY = {
+              'route29':1,'route30':1,'route31':1,'route46':1,
+              'darkcave':1,'sprouttower':1,'violetcity':1,'newbarktown':1,'cherrygrovecity':1,
+              'route32':2,'route33':2,'unioncave':2,'slowpokewell':2,'ruinsofalph':2,
+              'azaleatown':2,
+              'ilexforest':3,'route34':3,'route35':3,'route36':3,
+              'nationalpark':3,'goldenrodcity':3,'pokeathlon':3,
+              'route37':4,'route38':4,'route39':4,'burnedtower':4,'bellchim':4,
+              'ecruteakcity':4,'olivinecity':4,'mtmortar':4,
+          }
+          METHOD = {'land_mons': 0, 'water_mons':1, 'rock_smash_mons':2, 'fishing_mons':3}
+          WEIGHTS = {'land_mons':[20,20,10,10,10,10,5,5,4,4,1,1],
+                     'water_mons':[60,30,5,4,1], 'rock_smash_mons':[60,30,5,4,1],
+                     'fishing_mons':[70,30,60,20,20,40,40,15,4,1]}
+          
+          def species_constants():
+              data = (P/'include/constants/species.h').read_text()
+              ids = {}
+              for name, val in re.findall(r'^#define\s+SPECIES_([A-Z0-9_]+)\s+(\d+)\s*$',data,re.M):
+                  ids[name]=int(val)
+              return ids
+          
+          def get_block(text, begin):
+              depth=0
+              for i in range(begin,len(text)):
+                  if text[i]=='{': depth+=1
+                  elif text[i]=='}':
+                      depth-=1
+                      if depth==0: return text[begin:i+1]
+              raise ValueError('Unbalanced species definition')
+          
+          def species_info(ids):
+              # Read precisely the six evolution-group inputs gSpeciesInfo uses.
+              n=max(ids.values())+1
+              eligible=[False]*n
+              legendary=[False]*n
+              evolutions=[[] for _ in range(n)]
+              seen=set()
+              for path in sorted((P/'src/data/pokemon/species_info').glob('gen_*_families.h')):
+                  txt=path.read_text(encoding='utf-8')
+                  for m in re.finditer(r'\[\s*SPECIES_([A-Z0-9_]+)\s*\]\s*=\s*\{',txt):
+                      nm=m.group(1)
+                      if nm not in ids:continue
+                      block=get_block(txt, m.end()-1)
+                      sid=ids[nm];seen.add(sid)
+                      basehp=re.search(r'\.baseHP\s*=\s*(\d+)',block)
+                      invalid=bool(re.search(r'\.randomizerMode\s*=\s*MON_RANDOMIZER_INVALID',block))
+                      if not basehp or int(basehp.group(1))==0 or invalid:continue
+                      eligible[sid]=True
+                      legendary[sid]=bool(re.search(
+                          r'\.(?:isRestrictedLegendary|isSubLegendary|isMythical|isUltraBeast)\s*=\s*TRUE',block))
+                      evomatch=re.search(r'\.evolutions\s*=\s*EVOLUTION\s*\(', block)
+                      if evomatch:
+                          pos=evomatch.end()
+                          depth=1;begin=pos
+                          while depth and pos < len(block):
+                              if block[pos]=='(':depth+=1
+                              elif block[pos]==')':depth-=1
+                              pos+=1
+                          if depth:raise RuntimeError('Evolution macro unbalanced: '+nm)
+                          expr=block[begin:pos-1]
+                          # An EVOLUTION entry ends in the target species (3rd argument).
+                          targets=re.findall(r'\{\s*EVO_[A-Z0-9_]+\s*,[^{}]*?\bSPECIES_([A-Z0-9_]+)\s*\}',expr,re.S)
+                          evolutions[sid]=[ids[t] for t in targets if t in ids]
+              if sum(eligible)<900:raise RuntimeError('Too few usable species; game parser needs updating')
+              print('Eligible species:',sum(eligible),'evolution edges:',sum(map(len,evolutions)))
+              return eligible,legendary,evolutions
+          
+          
+          def build_table(eligible,legendary,evolutions,ids):
+              # Port of FillSpeciesGroupsEvolution and MarkEvolutions in src/randomizer.c.
+              # Similar Strength == MON_EVOLUTION, not MON_RANDOM_BST.
+              n=len(eligible)
+              INVALID=65535
+              EVO_NO_EVO=6  # RANDOMIZER_MAX_EVO_STAGES + 1
+              EVO_LEGEND=0x81
+              group=[0]*n
+              species=[0]*n
+              babies=['PICHU','CLEFFA','IGGLYBUFF','TYROGUE','SMOOCHUM','ELEKID',
+                      'MAGBY','AZURILL','WYNAUT','BUDEW','CHINGLING','BONSLY',
+                      'MIME_JR','HAPPINY','MUNCHLAX','MANTYKE']
+              for name in babies:
+                  i=ids.get(name)
+                  if i is None:raise RuntimeError('Missing baby species '+name)
+                  species[i]=i
+                  group[i]=0 if eligible[i] else INVALID
+          
+              def mark_evos(sid,stage):
+                  if stage==5:return
+                  if not eligible[sid]:
+                      species[sid]=sid;group[sid]=INVALID
+                      return
+                  for target in evolutions[sid]:
+                      if group[sid]<=stage:
+                          mark_evos(target,stage+1)
+                  species[sid]=sid
+                  group[sid]=stage
+          
+              for i in range(n):
+                  if species[i]==0:
+                      species[i]=i
+                      if not eligible[i]:group[i]=INVALID
+                      elif legendary[i]:group[i]=EVO_LEGEND
+                      elif not evolutions[i]:group[i]=EVO_NO_EVO
+                      else:mark_evos(i,0)
+          
+              # Same heap sort as BuildRandomizerSpeciesTable; no Python sorting.
+              start=n//2;end=n
+              def swap(a,b):
+                  group[a],group[b]=group[b],group[a]
+                  species[a],species[b]=species[b],species[a]
+              while end>1:
+                  if start>0:start-=1
+                  else:
+                      end-=1;swap(end,0)
+                  root=start
+                  while 2*root+1<end:
+                      child=2*root+1
+                      if child+1<end and group[child]<group[child+1]:child+=1
+                      if group[root]<group[child]:swap(root,child);root=child
+                      else:break
+              rev=[0]*n
+              for i,s in enumerate(species):rev[s]=i
+              if any(group[i]>group[i+1] for i in range(n-1)):
+                  raise RuntimeError('Evolution groups not sorted')
+              by_species=[group[rev[i]] for i in range(n)]
+              # Guardrail: similar-strength must never treat the first and final
+              # evolution in a standard three-stage family as the same group.
+              for a,b in [('CHARMANDER','CHARIZARD'),('HORSEA','KINGDRA')]:
+                  if a in ids and b in ids:
+                      if by_species[ids[a]] == by_species[ids[b]]:
+                          raise RuntimeError('Invalid evolution stages for '+a+' / '+b)
+              for nm in ['SKIDDO','HORSEA','WATTREL','WOOLOO','CRAMORANT','DWEBBLE']:
+                  if nm not in ids or by_species[ids[nm]]==INVALID:
+                      raise RuntimeError('Unavailable target '+nm)
+              print('Evolution-mode group distribution:',dict(collections.Counter(group)))
+              return group,species,rev
+          
+          def map_metadata():
+              groups=json.loads((P/'data/maps/map_groups.json').read_text())
+              mapping={}
+              for grnum,key in enumerate(groups['group_order']):
+                  for num,folder in enumerate(groups[key]):
+                      path=P/'data/maps'/folder/'map.json'
+                      if not path.exists():continue
+                      m=json.loads(path.read_text())
+                      mapping[m['id']]=(grnum,num,folder)
+              return mapping
+          
+          def stage_of(folder):
+              norm=re.sub('[^a-z0-9]','',folder.lower())
+              for token,stage in EARLY.items():
+                  if norm.startswith(token):return stage
+              return None
+          
+          def slots_from_json(ids,maps):
+              raw=json.loads((P/'src/data/wild_encounters.json').read_text())
+              slots=[]; count_excluded=0
+              for group in raw['wild_encounter_groups']:
+                  if not group.get('for_maps',False):continue
+                  for enc in group.get('encounters',[]):
+                      if enc['map'] not in maps:continue
+                      grnum,mapnum,folder=maps[enc['map']]
+                      stage=stage_of(folder)
+                      if stage is None:continue
+                      if grnum>30:continue
+                      label=enc.get('base_label','')
+                      time='Nacht' if 'night' in label.lower() else 'Tag' if 'day' in label.lower() else 'Alle'
+                      for kind,area in METHOD.items():
+                          if kind not in enc:continue
+                          for slot,mon in enumerate(enc[kind]['mons']):
+                              name=mon['species'].removeprefix('SPECIES_')
+                              if name not in ids:continue
+                              # Safari/secret rock smash from routes require additional badges.
+                              actualstage=stage
+                              if area==1: actualstage=max(stage,5) # Surf badge 4 required, therefore after 4th gym
+                              if area==2: actualstage=max(stage,3) # Rock Smash access
+                              if area==3:
+                                  if slot>=5: continue # Super Rod not early obtainable
+                                  if slot>=2: actualstage=max(stage,4) # Good Rod, Olivine City
+                                  else: actualstage=max(stage,2) # Old Rod near Route 32
+                              if actualstage>4:continue
+                              wt=WEIGHTS[kind][slot] if slot<len(WEIGHTS[kind]) else 0
+                              slots.append({'gr':grnum,'num':mapnum,'area':area,'slot':slot,
+                                            'original':ids[name],'stage':actualstage,
+                                            'percent':wt,'label':folder,'time':time,
+                                            'level':f"{mon['min_level']}-{mon['max_level']}",
+                                            'method':kind, 'orig_name':name})
+              if not slots:raise RuntimeError('No early Johto encounters found')
+              print('Early encounter slots:',len(slots),'maps:',len(set(x['label'] for x in slots)))
+              return slots
+          
+          # Exactly the same SFC32 stream and 10 warming iterations as the ROM.
+          C = r'''
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <limits.h>
+          #include "game_data.h"
+          typedef struct { uint32_t a,b,c,ctr; } RNG;
+          static inline uint32_t next(RNG *r) {
+            uint32_t result=r->a+r->b+r->ctr; r->ctr+=17;
+            r->a=r->b^(r->b>>9); r->b=r->c*9;
+            r->c=result+((r->c<<21)|(r->c>>11));return result;
+          }
+          static inline uint32_t randrange(RNG*r,uint32_t range) {
+            if(range<2)return 0;
+            uint32_t n=range-1;
+            n|=n>>1;n|=n>>2;n|=n>>4;n|=n>>8;
+            uint32_t mask=n;
+            uint32_t value;
+            do{value=next(r)&mask;}while(value>=range);
+            return value;
+          }
+          static int first(int group) {
+            int lo=0,hi=N;
+            while(lo<hi){int mid=(lo+hi)/2;if(groups[mid]<group)lo=mid+1;else hi=mid;}
+            return lo;
+          }
+          static int last(int group) {
+            int lo=0,hi=N;
+            while(lo<hi){int mid=(lo+hi)/2;if(groups[mid]<=group)lo=mid+1;else hi=mid;}
+            return lo;
+          }
+          static inline uint16_t wild(uint32_t seed,const Row *r){
+            int original=r->original;
+            if(original<1||original>=N||group_by_species[original]==65535)return original;
+            int group=group_by_species[original];
+            int min=first(group),max=last(group);
+            RNG rng={seed,seed^(uint32_t)original,
+              seed^(((uint32_t)r->gr<<24)|((uint32_t)r->num<<16)|((uint32_t)r->area<<8)|r->slot),17};
+            for(int i=0;i<10;i++)next(&rng);
+            for(int attempts=0;attempts<8;attempts++){
+              int idx=min+(int)randrange(&rng,(uint32_t)(max-min));
+              int result=ordered_species[idx];
+              if(group_by_species[result]!=65535)return result;
+            }
+            return original;
+          }
+          static void check(uint32_t seed){
+            int matched[6],winner[6];
+            for(int j=0;j<6;j++){matched[j]=9999;winner[j]=-1;}
+            for(int i=0;i<ROWS;i++){
+              uint16_t mon=wild(seed,&rows[i]);
+              for(int j=0;j<6;j++)if(mon==targets[j]){
+                int score=rows[i].stage*100+(20-rows[i].percent);
+                if(score<matched[j]){matched[j]=score;winner[j]=i;}
+              }
+            }
+            printf("CHECK %u",seed);
+            for(int j=0;j<6;j++)printf(" %d",winner[j]);
+            printf("\n");
+          }
+          int main(int argc,char**argv){
+            const uint32_t MAX_SEED=350000;
+            uint64_t bestScore=UINT64_MAX;
+            uint32_t bestSeed=0;
+            int bestIndices[6],bestFound=0;
+            for(uint32_t seed=1;seed<=MAX_SEED;seed++){
+              int score[6]={9999,9999,9999,9999,9999,9999};
+              int idx[6]={-1,-1,-1,-1,-1,-1};
+              int found=0;
+              for(int i=0;i<ROWS;i++){
+                uint16_t mon=wild(seed,&rows[i]);
+                for(int j=0;j<6;j++)if(mon==targets[j]){
+                  int candidate=rows[i].stage*100+(20-rows[i].percent);
+                  if(candidate<score[j]){
+                    if(idx[j]<0)found++;
+                    score[j]=candidate;idx[j]=i;
+                  }
+                }
+              }
+              if(found>bestFound){bestFound=found;fprintf(stderr,"Best coverage %d/6 at seed %u\n",found,seed);}
+              if(found==6){
+                uint64_t sum=0;
+                for(int j=0;j<6;j++)sum+=score[j];
+                if(sum<bestScore){
+                  bestScore=sum;bestSeed=seed;
+                  for(int j=0;j<6;j++)bestIndices[j]=idx[j];
+                  printf("BEST %u %llu",seed,(unsigned long long)sum);
+                  for(int j=0;j<6;j++)printf(" %d",idx[j]);
+                  printf("\n");fflush(stdout);
+                }
+                if(bestScore<=680)break; // all six effectively accessible extremely early
+              }
+            }
+            if(bestSeed){
+              printf("FINAL %u %llu",bestSeed,(unsigned long long)bestScore);
+              for(int j=0;j<6;j++)printf(" %d",bestIndices[j]);
+              printf("\n");
+            }else printf("FINAL_NONE best_coverage=%d\n",bestFound);
+            check(0x75F9DD17u); // user's old saved game, for plausibility control
+            int eguana=0, balgoras=0;
+            for(int i=0;i<ROWS;i++){
+              int sp=wild(0x75F9DD17u,&rows[i]);
+              if(old_check_maps[i]==1 && sp==694)eguana++;
+              if(old_check_maps[i]==2 && sp==696)balgoras++;
+            }
+            printf("OLD_VALIDATION EGUANA_ROUTE46=%d BALGORAS_SLOWPOKE_WELL=%d\n",eguana,balgoras);
+            if(bestSeed){
+              for(int i=0;i<ROWS;i++)if(first_route_checks[i])
+                printf("TEST_ROUTE29 %d %u\n",i,(unsigned)wild(bestSeed,&rows[i]));
+            }
+            return 0;
+          }
+          '''
+          
+          def build_c(eligible,legendary,groups,order,rev,slots,ids):
+              by_species=[groups[rev[i]] for i in range(len(groups))]
+              targets=[ids[nm] for _,nm in TARGETS]
+              def arr(values): return ','.join(str(x) for x in values)
+              def g(a): return '\n'.join(','.join(str(x) for x in a[i:i+24])+',' for i in range(0,len(a),24))
+              header = ('#include <stdint.h>\n'
+                  'typedef struct {uint8_t gr,num,area,slot; uint16_t original; uint8_t stage,percent;} Row;\n'
+                  f'#define N {len(groups)}\n#define ROWS {len(slots)}\n'
+                  f'static const uint16_t targets[6]={{ {arr(targets)} }};\n'
+                  f'static const uint16_t groups[N]={{\n{g(groups)}\n}};\n'
+                  f'static const uint16_t ordered_species[N]={{\n{g(order)}\n}};\n'
+                  f'static const uint16_t group_by_species[N]={{\n{g(by_species)}\n}};\n'
+                  'static const uint8_t first_route_checks[ROWS]={\n' + g([1 if z['label'].startswith('Route29') and z['method']=='land_mons' and z['time']=='Tag' and z['percent']>=10 else 0 for z in slots]) + '\n};\n' +
+                  'static const uint8_t old_check_maps[ROWS]={\n' + g([1 if 'Route46_hns' in z['label'] else 2 if 'SlowpokeWell' in z['label'] else 0 for z in slots]) + '\n};\n' +
+                  'static const Row rows[ROWS]={\n'+
+                  '\n'.join(' {'+arr([x['gr'],x['num'],x['area'],x['slot'],x['original'],x['stage'],x['percent']])+'},' for x in slots)+'\n};\n')
+              (OUT/'game_data.h').write_text(header)
+              (OUT/'search.c').write_text(C)
+              subprocess.run(['gcc','-O3','-std=c11','-o',str(OUT/'search'),str(OUT/'search.c')],check=True)
+          
+          def main():
+              ids=species_constants()
+              eligible,legendary,evolutions=species_info(ids)
+              groups,order,rev=build_table(eligible,legendary,evolutions,ids)
+              maps=map_metadata()
+              slots=slots_from_json(ids,maps)
+              build_c(eligible,legendary,groups,order,rev,slots,ids)
+              result=subprocess.run([str(OUT/'search')],text=True,capture_output=True,check=True)
+              (OUT/'seed_search.log').write_text(result.stdout+'\n'+result.stderr)
+              lines=result.stdout.strip().splitlines()
+              validations = [x for x in lines if x.startswith('OLD_VALIDATION ')]
+              if validations:(OUT/'Alte_Fundorte_Kontrolle.txt').write_text(validations[-1]+'\n'+
+                  'Nur eine Kontrollrechnung: Der frühere Save/Seed kann von dieser Code-Version abweichen.\n', encoding='utf-8')
+              final=[x.split() for x in lines if x.startswith('FINAL ')]
+              if not final:
+                  (OUT/'ERGEBNIS.txt').write_text('Kein vollständiger Seed bis zur Suchgrenze gefunden. Keine ROM bauen.\n')
+                  return
+              chosen=final[-1]
+              seed=int(chosen[1]); indices=[int(x) for x in chosen[3:9]]
+              rows=[]
+              for (german,english),index in zip(TARGETS,indices):
+                  s=slots[index]
+                  label=s['label'].replace('_hns','').replace('_',' ')
+                  method={'land_mons':'Gras/Höhle','fishing_mons':'Angeln','rock_smash_mons':'Zertrümmerer','water_mons':'Surfen'}[s['method']]
+                  if method=='Angeln':method+=' (Alte Angel)' if s['slot']<2 else ' (Profiangel)'
+                  rows.append([german,english,label,method,s['time'],s['stage'],s['level'],s['percent'],s['gr'],s['num'],s['slot'],s['orig_name']])
+              with (OUT/'Wunschteam_Fundorte.csv').open('w',encoding='utf-8-sig',newline='') as f:
+                  w=csv.writer(f,delimiter=';')
+                  w.writerow(['Pokémon','Species English','Fundort','Methode','Tageszeit','Etappe ca.','Level','Slot-Chance %','Map Group','Map Number','Slot','Original Pokémon'])
+                  w.writerows(rows)
+              msg=f"SIMILAR STRENGTH AN (ENTWICKLUNGSSTUFEN)\n\nKANDIDAT: Seed {seed} / 0x{seed:08X}\n\n"+''.join(f"{r[0]}: {r[2]}, {r[3]}, {r[4]}, Etappe {r[5]}, Level {r[6]}, Slot {r[7]}%\n" for r in rows)
+              msg+='\nWICHTIG: Diese Fundorte sind Vorhersagen einer unabhängigen Nachbildung. Zuerst im Spiel prüfen!\n'
+              (OUT/'ERGEBNIS.txt').write_text(msg,encoding='utf-8')
+              (OUT/'SEED.txt').write_text(str(seed))
+              # Two common encounters on Route 29 provide a practical falsification test.
+              reverse_names={value:name for name,value in ids.items()}
+              checks=[x.split() for x in lines if x.startswith('TEST_ROUTE29 ')]
+              with (OUT/'Route29_Kontrollbegegnungen.csv').open('w',encoding='utf-8-sig',newline='') as f:
+                  w=csv.writer(f,delimiter=';')
+                  w.writerow(['Gebiet','Zeit','Art vorhergesagt (englisch)','Chance %','Level','Slot'])
+                  for x in checks:
+                      row=slots[int(x[1])]
+                      w.writerow([row['label'],row['time'],reverse_names.get(int(x[2]),x[2]),
+                                  row['percent'],row['level'],row['slot']])
+              # Reproduce old previously described seed predictions for independent checks.
+              old=[x.split() for x in lines if x.startswith('CHECK ')]
+              if old:
+                  oldinds=list(map(int,old[-1][2:8]))
+                  report=['Alter Seed (0x75F9DD17):']
+                  for (de,en),index in zip(TARGETS,oldinds):
+                      report.append(f"{de}: " + (f"{slots[index]['label']} {slots[index]['method']}" if index>=0 else 'nicht in den frühen Gebieten'))
+                  (OUT/'ALTE_SEED_KONTROLLE.txt').write_text('\n'.join(report),encoding='utf-8')
+          
+          if __name__=='__main__':main()
+          PYCODE
+
+      - name: Sechs Wunsch-Pokemon mit Similar Strength suchen
+        run: python3 hns_seed_finder.py
+
+      - name: Spoilerfrei bestaetigen ob ein passender Seed gefunden wurde
+        run: |
+          test -s seed_finder_output/SEED.txt && echo "Kandidat gefunden: Alle sechs Wunsch-Pokemon werden frueh vorausgesagt. Keine Fundorte im Log."
+
+      - name: Gewaehlten Seed fuer einen frischen Run fest ins Spiel setzen
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+          seed = int(Path('seed_finder_output/SEED.txt').read_text().strip())
+          path = Path('src/randomizer.c')
+          text = path.read_text(encoding='utf-8')
+          pattern = r'u32 GetRandomizerSeed\(void\)\s*\{.*?\n\}\s*(?=bool32 SetRandomizerSeed)'
+          fixed = f'u32 GetRandomizerSeed(void)\n{{\n    return 0x{seed:08X}u;\n}}\n'
+          text, n = re.subn(pattern, lambda m: fixed, text, flags=re.S)
+          if n != 1: raise SystemExit('Die Seed-Funktion wurde nicht gefunden. ROM unveraendert.')
+          path.write_text(text, encoding='utf-8')
+          print(f'Deterministic randomizer seed: 0x{seed:08X} ({seed})')
+
+          path=Path('include/config/debug.h')
+          text=path.read_text(encoding='utf-8')
+          text,n1=re.subn(r'(#define\s+DEBUG_OVERWORLD_MENU\s+)(?:DISABLED_ON_RELEASE|FALSE|TRUE)',r'\g<1>TRUE',text,count=1)
+          text,n2=re.subn(r'(#define\s+DEBUG_OVERWORLD_IN_MENU\s+)(?:FALSE|TRUE)',r'\g<1>TRUE',text,count=1)
+          if n1 != 1 or n2 != 1:raise SystemExit('Debug configuration not found')
+          path.write_text(text, encoding='utf-8')
+          print('Debug menu activated')
+          PYCODE
+
+      - name: GBA Compiler installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils-arm-none-eabi gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libpng-dev python3 make gcc g++
+
+      - name: Deutsche Similar-Strength-ROM bauen
+        run: make -j2 hns
+
+      - name: Gepatchte ROM ueberpruefen
+        run: test -s pokehns.gba && ls -lh pokehns.gba
+
+      - name: Report und ROM bereitstellen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Heart-Soul-Similar-Strength-ROM-und-Seed
+          path: |
+            seed_finder_output/ERGEBNIS.txt
+            seed_finder_output/Wunschteam_Fundorte.csv
+            seed_finder_output/Alte_Fundorte_Kontrolle.txt
+            seed_finder_output/seed_search.log
+            seed_finder_output/SEED.txt
+            seed_finder_output/Route29_Kontrollbegegnungen.csv
+            pokehns.gba
+          if-no-files-found: warn
+          retention-days: 7
